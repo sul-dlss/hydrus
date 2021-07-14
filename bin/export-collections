@@ -1,0 +1,77 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Usage:
+#   RAILS_ENV=production bin/export-collections > collections.jsonl
+
+COLLECTION_DRUIDS_LIST = 'collection_druids.txt'
+GRAVEYARD_APO = 'druid:kg712km1576'
+UNIVERSITY_ARCHIVES_APO = 'druid:yf767bj4831'
+
+require_relative '../config/environment'
+
+collection_druids = File.exist?(COLLECTION_DRUIDS_LIST) ?
+                      File.read(COLLECTION_DRUIDS_LIST).split.map { |bare_druid| "druid:#{bare_druid}" } :
+                      []
+
+list = collection_druids.any? ?
+         Hydrus::Collection.find(collection_druids) :
+         Hydrus::Collection.all
+
+def events_for(coll)
+  coll.get_hydrus_events.map do |event|
+    {
+      who: event.who, # is a bare sunetid string, maps to user_id
+      when: event.when, # is a UTC timestamp string, maps to created_at/updated_at
+      text: event.text # is a string, maps to event_type ('update_metadata') and description
+      # mapping also requires an eventable_type ('Collection') and an eventable_id (the collection ID)
+    }
+  end
+end
+
+def serialize(coll)
+  creator = coll.events.ng_xml.xpath('//event[text()="Collection created"]/@who').to_s
+  return if coll.admin_policy_object_id == GRAVEYARD_APO
+  if coll.admin_policy_object_id == UNIVERSITY_ARCHIVES_APO
+    warn "Collection #{coll.id} is in the University Archives APO, which is not a Hydrus::APO"
+    return
+  end
+
+  apo = coll.apo
+  related_items = coll.related_items.map { |rel| { link_title: rel.title.presence, url: rel.url.presence }.compact }.reject(&:blank?)
+
+  {
+    druid: coll.id,
+    version: coll.current_version.to_i,
+    creator: { sunetid: creator },
+    name: coll.title,
+    description: coll.abstract,
+    contact_email: coll.contact,
+    visibility_option: coll.visibility_option,
+    visibility: coll.visibility,
+    embargo_option: coll.embargo_option,
+    embargo_terms: coll.embargo_terms,
+    requires_human_approval: coll.requires_human_approval,
+    license_option: coll.license_option,
+    license: coll.license,
+    object_status: coll.object_status,
+    managers: apo.persons_with_role('hydrus-collection-manager'),
+    depositors: apo.persons_with_role('hydrus-collection-item-depositor') + apo.persons_with_role('hydrus-collection-depositor'),
+    reviewers: apo.persons_with_role('hydrus-collection-reviewer'),
+    related_items: related_items,
+    events: events_for(coll),
+    created_at: coll.create_date,
+    updated_at: coll.modified_date
+  }
+end
+
+warn "Exporting #{list.count} collections"
+
+list.map do |collection|
+  if collection.catkey.present?
+    warn "Skipping #{collection.pid} because it has a catkey"
+    next
+  end
+
+  puts serialize(collection).to_json
+end

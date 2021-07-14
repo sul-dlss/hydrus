@@ -1,0 +1,151 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Usage:
+#   RAILS_ENV=production bin/export-items > items.jsonl
+
+COLLECTION_DRUIDS_LIST = 'collection_druids.txt'
+GRAVEYARD_APO = 'druid:kg712km1576'
+
+# This list from: https://docs.google.com/spreadsheets/d/1Gu0TIUpNByNgNtFDn5MJARUvtsgcNXJAHiKf5s_NsUc/edit#gid=0
+# NOTE: we don't need to worry about the "hydrus object with DOI", because these are not returned in the query
+# for Hydrus::Items as they have been converted to Dor::Item.
+ITEMS_TO_EXCLUDE = %w[
+  druid:ty334nd6571
+  druid:bx749bs2681
+  druid:zc000fq4044
+  druid:pr213sh5046
+  druid:jr671fk0644
+]
+
+require_relative '../config/environment'
+
+# Monkey-patch AF to allow using HTTP POST (for querying items by their collection)
+module ActiveFedora
+  class SolrService
+    def self.query(query, args={})
+      raw = args.delete(:raw)
+      args = args.merge(:q=>query, :qt=>'standard')
+      result = SolrService.instance.conn.post('select', :data=>args)
+      return result if raw
+      result['response']['docs']
+    end
+  end
+
+  module FinderMethods
+    def find_in_batches conditions, opts={}
+      data = { :q => create_query(conditions) }
+      opts[:qt] = @klass.solr_query_handler
+      #set default sort to created date ascending
+      unless opts[:sort].present?
+        opts[:sort]= @klass.default_sort_params
+      end
+
+      batch_size = opts.delete(:batch_size) || 1000
+
+      counter = 0
+      begin
+        counter += 1
+        response = ActiveFedora::SolrService.instance.conn.paginate counter, batch_size, "select", { :method => :post, :params => opts, :data => data }
+        docs = response["response"]["docs"]
+        yield docs
+      end while docs.has_next?
+    end
+  end
+end
+
+collection_druids = if File.exist?(COLLECTION_DRUIDS_LIST)
+                      File.read(COLLECTION_DRUIDS_LIST).split.map { |bare_druid| "druid:#{bare_druid}" }
+                    else
+                      []
+                    end
+
+list = if collection_druids.any?
+         where_collection_in_list_query = ActiveFedora::SolrService.construct_query_for_rel(
+           collection_druids.map { |druid| [:is_member_of_collection, "info:fedora/#{druid}"] },
+           ' OR '
+         )
+         Hydrus::Item.where(where_collection_in_list_query)
+       else
+         Hydrus::Item.all
+       end
+
+def contributors(item)
+  item.contributors.
+    map { |contrib| { full_name: contrib.name, role: contrib.role, name_type: contrib.name_type }}.
+    reject { |contrib| contrib[:full_name].blank? }
+end
+
+def files(item)
+  item.files.
+    map do |object_file|
+      {
+        path: File.realdirpath(object_file.current_path),
+        label: object_file.label,
+        hide: object_file.hide
+      }
+    end
+end
+
+def events_for(item)
+  item.get_hydrus_events.map do |event|
+    {
+      who: event.who, # is a bare sunetid string, maps to user_id
+      when: event.when, # is a UTC timestamp string, maps to created_at/updated_at
+      text: event.text # is a string, maps to event_type ('update_metadata') and description
+      # mapping also requires an eventable_type ('Work') and an eventable_id (the work ID)
+    }
+  end
+end
+
+def serialize(item)
+  creator = item.roleMetadata.ng_xml.xpath('//role/person/identifier').text
+  related_items = item.related_items.map { |rel| { link_title: rel.title.presence, url: rel.url.presence }.compact }.reject(&:blank?)
+  {
+    druid: item.id,
+    version: item.current_version.to_i,
+    creator: { sunetid: creator },
+    title: item.title,
+    abstract: item.abstract,
+    contact_email: item.contact,
+    collection: item.collection_id,
+    visibility: item.visibility.first,
+    license: item.license,
+    embargo_release_date: item.rmd_embargo_release_date,
+    date_created: item.date_created,
+    object_status: item.object_status,
+    item_type: item.item_type,
+    citation: item.preferred_citation,
+    related_items: related_items,
+    related_citations: item.related_citation,
+    contributors: contributors(item),
+    keywords: item.keywords,
+    files: files(item),
+    events: events_for(item),
+    created_at: item.create_date,
+    updated_at: item.modified_date
+  }
+end
+
+warn "Exporting #{list.count} items"
+count = 0
+list.each do |item|
+  count += 1
+  warn count
+  begin
+    if item.apo_pid == GRAVEYARD_APO
+      warn "Skipping #{item.pid} because it belongs to the Graveyard APO"
+      next
+    elsif item.catkey.present?
+      warn "Skipping #{item.pid} because it has a catkey"
+      next
+    elsif ITEMS_TO_EXCLUDE.include? item.pid
+      warn "Skipping #{item.pid} because it is on the list of items to exclude"
+      next
+    end
+    attributes = serialize(item)
+    puts attributes.compact.to_json
+  rescue => e
+    warn "Error with #{item.pid}. #{e.message}"
+  end
+end
